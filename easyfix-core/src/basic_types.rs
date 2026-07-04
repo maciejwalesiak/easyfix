@@ -32,8 +32,25 @@ pub type Boolean = bool;
 pub type Char = u8;
 pub type MultipleCharValue = Vec<Char>;
 
-#[derive(Clone, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FixString(Vec<u8>);
+
+/// Returns an empty `FixString` - a "not yet set" placeholder, not a
+/// valid field value.
+///
+/// Every FIX field must carry at least one byte, so an empty value never
+/// reaches the wire: serializing it fails with
+/// [`SerializeError::EmptyValue`]. This impl exists so structs with
+/// `FixString` fields can implement `Default` (`..Default::default()`
+/// construction, session headers filled in at transmit time). To express
+/// a genuinely absent value, use `Option<FixString>` instead.
+///
+/// [`SerializeError::EmptyValue`]: crate::serializer::SerializeError::EmptyValue
+impl Default for FixString {
+    fn default() -> FixString {
+        FixString(Vec::new())
+    }
+}
 
 #[derive(Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
@@ -354,14 +371,6 @@ macro_rules! fix_format {
 }
 
 impl FixString {
-    pub const fn new() -> FixString {
-        FixString(Vec::new())
-    }
-
-    pub fn with_capacity(capacity: usize) -> FixString {
-        FixString(Vec::with_capacity(capacity))
-    }
-
     /// Converts a vector of bytes to a `FixString`.
     ///
     /// A FIX string ([`FixString`]) is made of bytes ([`u8`]),
