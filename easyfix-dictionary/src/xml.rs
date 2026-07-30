@@ -1,0 +1,315 @@
+//! XML parsing and representation of FIX dictionary elements.
+//!
+//! This module handles the deserialization of FIX XML dictionaries into
+//! Rust structures using serde and quick-xml. It defines the basic types
+//! and structures that represent the components of a FIX dictionary:
+//! - Data types (FixType, BasicType, etc.)
+//! - XML-based structures (Field, Component, Group, etc.)
+//! - Serialization/deserialization helpers for FIX-specific formats
+
+use easyfix_core::{basic_types::FixString, version::SessionProtocol};
+use serde::{Deserialize, Deserializer, Serialize};
+
+#[cfg(test)]
+mod tests;
+
+// Module for custom serialization of boolean "required" field
+mod required_flag {
+    use serde::{Deserialize, Deserializer, Serializer, de};
+
+    // Deserialize function for required flag
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<bool, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "Y" | "YES" | "y" | "yes" => Ok(true),
+            "N" | "NO" | "n" | "no" => Ok(false),
+            _ => Err(de::Error::custom(format!(
+                "invalid `required` flag value: {s}",
+            ))),
+        }
+    }
+
+    // Serialize function for required flag
+    pub fn serialize<S>(value: &bool, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let s = if *value { 'Y' } else { 'N' };
+        serializer.serialize_char(s)
+    }
+}
+
+/// A member of a message, component, or group in the FIX dictionary.
+///
+/// This enum represents the three possible member types in the FIX protocol:
+/// - Field: A simple data element
+/// - Component: A reusable collection of fields/components/groups
+/// - Group: A repeating section
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Member {
+    /// A field member with name and required flag
+    #[serde(rename = "field")]
+    Field(MemberRef),
+
+    /// A component member with name and required flag
+    #[serde(rename = "component")]
+    Component(MemberRef),
+
+    /// A group member (repeating section)
+    #[serde(rename = "group")]
+    Group(Group),
+}
+
+/// A reference to a field or component member.
+///
+/// This structure represents a reference to a field or component,
+/// including its name and whether it's required in its parent container.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemberRef {
+    /// The name of the referenced field or component
+    #[serde(rename = "@name")]
+    pub name: FixString,
+
+    /// Whether this member is required in its parent
+    #[serde(rename = "@required")]
+    #[serde(with = "required_flag")]
+    pub required: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Header {
+    #[serde(rename = "$value")]
+    #[serde(default)]
+    pub members: Vec<Member>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Trailer {
+    #[serde(rename = "$value")]
+    #[serde(default)]
+    pub members: Vec<Member>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Component {
+    #[serde(rename = "@name")]
+    pub name: FixString,
+    //pub group: Option<Group>,
+    #[serde(rename = "$value")]
+    // enable `default`, empty members list is handled on higher layer
+    #[serde(default)]
+    pub members: Vec<Member>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Group {
+    #[serde(rename = "@name")]
+    pub name: FixString,
+    #[serde(rename = "@required")]
+    #[serde(with = "required_flag")]
+    pub required: bool,
+    #[serde(rename = "$value")]
+    pub members: Vec<Member>,
+}
+
+/// Basic data types defined in the FIX protocol.
+///
+/// These types define the format and validation rules for FIX field values.
+/// Each field in a FIX message is associated with one of these types.
+#[derive(Clone, Copy, Debug, Deserialize, Hash, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum BasicType {
+    /// Amount (decimal number with specific precision)
+    Amt,
+    /// Boolean value (Y/N)
+    Boolean,
+    /// Single character
+    Char,
+    /// Country code (ISO 3166)
+    Country,
+    /// Currency code (ISO 4217)
+    Currency,
+    /// Raw binary data
+    Data,
+    /// Exchange identifier
+    Exchange,
+    /// Floating point number
+    Float,
+    /// Integer number (renamed from LONG in some dictionaries)
+    #[serde(alias = "LONG")]
+    Int,
+    /// Language identifier (ISO 639-1)
+    Language,
+    /// Binary data length
+    Length,
+    /// Local market date (YYYYMMDD)
+    LocalMktDate,
+    /// Month and year (YYYYMM or YYYYMMDD or YYYYMMWW)
+    MonthYear,
+    /// Multiple character value (space-delimited)
+    MultipleCharValue,
+    /// Multiple string value (space-delimited)
+    MultipleStringValue,
+    /// Number of entries in a repeating group
+    NumInGroup,
+    /// Percentage value
+    Percentage,
+    /// Price value (decimal number with specific precision)
+    Price,
+    /// Price offset value
+    PriceOffset,
+    /// Quantity value (decimal number with specific precision)
+    Qty,
+    /// Sequence number
+    SeqNum,
+    /// Character string (non-binary)
+    String,
+    /// FX tenor expression ([DMWY]\d+, e.g. "D5", "M3", "W13", "Y1")
+    Tenor,
+    /// Time with timezone
+    TzTimeOnly,
+    /// Timestamp with timezone
+    TzTimestamp,
+    /// UTC date (YYYYMMDD)
+    UtcDateOnly,
+    /// UTC time (HH:MM:SS.sss)
+    UtcTimeOnly,
+    /// UTC timestamp (YYYYMMDD-HH:MM:SS.sss)
+    UtcTimestamp,
+    /// XML data
+    XmlData,
+}
+
+/// A field definition in the FIX dictionary.
+///
+/// Fields are the basic elements of FIX messages, representing individual
+/// data points with specific types and possible enumerated values.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Field {
+    /// The tag number that identifies this field
+    #[serde(rename = "@number")]
+    pub number: u16,
+
+    /// The human-readable name of this field
+    #[serde(rename = "@name")]
+    pub name: FixString,
+
+    /// The data type of this field
+    #[serde(rename = "@type")]
+    pub data_type: BasicType,
+
+    /// Optional enumerated values for this field
+    #[serde(rename = "$value")]
+    pub values: Option<Vec<Value>>,
+}
+
+/// An enumerated value for a field.
+///
+/// Some FIX fields have a predefined set of valid values, each with a
+/// specific meaning. This struct represents such a value.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Value {
+    /// The actual value (as it appears on the wire)
+    #[serde(rename = "@enum")]
+    pub value_enum: FixString,
+
+    /// Human-readable description of what this value means
+    #[serde(rename = "@description")]
+    pub description: FixString,
+}
+
+/// Message category in the FIX protocol.
+///
+/// FIX messages are divided into two categories: administrative messages
+/// for session management, and application messages for business functionality.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MsgCat {
+    /// Administrative messages (session management)
+    #[serde(rename = "admin")]
+    Admin,
+
+    /// Application messages (business functionality)
+    #[serde(rename = "app")]
+    App,
+}
+
+pub use easyfix_core::basic_types::MsgTypeField as MsgType;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Message {
+    #[serde(rename = "@name")]
+    pub name: FixString,
+    #[serde(rename = "@msgtype")]
+    pub msg_type: MsgType,
+    #[serde(rename = "@msgcat")]
+    pub msg_cat: MsgCat,
+    #[serde(rename = "$value")]
+    // enable `default`, empty members list is handled on higher layer
+    #[serde(default)]
+    pub members: Vec<Member>,
+}
+
+fn unwrap_messages<'de, D>(deserializer: D) -> Result<Vec<Message>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    /// Represents <list>...</list>
+    #[derive(Deserialize)]
+    struct List {
+        // default allows empty list
+        //#[serde(default)]
+        message: Vec<Message>,
+    }
+    Ok(List::deserialize(deserializer)?.message)
+}
+
+fn unwrap_components<'de, D>(deserializer: D) -> Result<Vec<Component>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    /// Represents <list>...</list>
+    #[derive(Deserialize)]
+    struct List {
+        // default allows empty list
+        #[serde(default)]
+        component: Vec<Component>,
+    }
+    Ok(List::deserialize(deserializer)?.component)
+}
+
+fn unwrap_fields<'de, D>(deserializer: D) -> Result<Vec<Field>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    /// Represents <list>...</list>
+    #[derive(Deserialize)]
+    struct List {
+        // default allows empty list
+        //#[serde(default)]
+        field: Vec<Field>,
+    }
+    Ok(List::deserialize(deserializer)?.field)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Dictionary {
+    #[serde(rename = "@type")]
+    pub session_protocol: SessionProtocol,
+    #[serde(rename = "@major")]
+    pub major: u8,
+    #[serde(rename = "@minor")]
+    pub minor: u8,
+    #[serde(rename = "@servicepack")]
+    pub servicepack: u8,
+    pub header: Header,
+    pub trailer: Trailer,
+    #[serde(deserialize_with = "unwrap_messages")]
+    pub messages: Vec<Message>,
+    #[serde(deserialize_with = "unwrap_components")]
+    pub components: Vec<Component>,
+    #[serde(deserialize_with = "unwrap_fields")]
+    pub fields: Vec<Field>,
+}

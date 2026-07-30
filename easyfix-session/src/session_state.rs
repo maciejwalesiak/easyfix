@@ -1,26 +1,35 @@
-use std::{collections::BTreeMap, ops::RangeInclusive};
-
-use easyfix_messages::{
-    fields::{Int, SeqNum},
-    messages::FixtMessage,
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt::Debug,
+    ops::RangeInclusive,
+    time::Instant,
 };
-use tokio::time::Instant;
+
+use easyfix_core::{
+    basic_types::{FixString, SeqNum},
+    message::SessionMessage,
+};
+use tracing::{instrument, trace};
 
 use crate::messages_storage::MessagesStorage;
 
 #[derive(Debug)]
-struct Messages(BTreeMap<SeqNum, Box<FixtMessage>>);
+struct Messages<M>(BTreeMap<SeqNum, Box<M>>);
 
-impl Messages {
-    fn new() -> Messages {
+impl<M: Debug> Messages<M> {
+    fn new() -> Messages<M> {
         Messages(BTreeMap::new())
     }
 
-    fn enqueue(&mut self, seq_num: SeqNum, msg: Box<FixtMessage>) {
+    fn first_seq(&self) -> Option<SeqNum> {
+        self.0.keys().next().copied()
+    }
+
+    fn enqueue(&mut self, seq_num: SeqNum, msg: Box<M>) {
         self.0.insert(seq_num, msg);
     }
 
-    fn retrieve(&mut self, seq_num: SeqNum) -> Option<Box<FixtMessage>> {
+    fn retrieve(&mut self, seq_num: SeqNum) -> Option<Box<M>> {
         self.0.remove(&seq_num)
     }
 
@@ -30,20 +39,17 @@ impl Messages {
 }
 
 #[derive(Debug)]
-pub(crate) struct State<S> {
+pub(crate) struct State<M, S> {
     enabled: bool,
     received_logon: bool,
-    sent_logout: bool,
-    sent_logon: bool,
-    sent_reset: bool,
+    logon_sent: bool,
+    logout_sent_time: Option<Instant>,
+    reset_sent: bool,
     reset_received: bool,
     initiate: bool,
-    test_request: Int,
     resend_range: Option<RangeInclusive<SeqNum>>,
-    heart_bt_int: Int,
     last_sent_time: Instant,
     last_received_time: Instant,
-    input_timeout_cnt: u32,
 
     disconnected: bool,
 
@@ -55,30 +61,30 @@ pub(crate) struct State<S> {
     /// This value is used to populate the resendRange if necessary.
     next_expected_msg_seq_num: SeqNum,
 
-    queue: Messages,
+    queue: Messages<M>,
     messages_storage: S,
+
+    grace_period_test_req_ids: HashSet<FixString>,
 }
 
-impl<S: MessagesStorage> State<S> {
-    pub(crate) fn new(messages_storage: S) -> State<S> {
+impl<M: SessionMessage, S: MessagesStorage> State<M, S> {
+    pub(crate) fn new(messages_storage: S) -> State<M, S> {
         State {
             enabled: true,
             received_logon: false,
-            sent_logout: false,
-            sent_logon: false,
-            sent_reset: false,
+            logon_sent: false,
+            logout_sent_time: None,
+            reset_sent: false,
             reset_received: false,
             initiate: false,
-            test_request: 0,
             resend_range: None,
-            heart_bt_int: 10,
             last_sent_time: Instant::now(),
             last_received_time: Instant::now(),
-            input_timeout_cnt: 0,
             disconnected: true,
             next_expected_msg_seq_num: 0,
             queue: Messages::new(),
             messages_storage,
+            grace_period_test_req_ids: HashSet::new(),
         }
     }
 
@@ -96,20 +102,24 @@ impl<S: MessagesStorage> State<S> {
         self.received_logon = logon_received;
     }
 
-    pub fn logout_sent(&self) -> bool {
-        self.sent_logout
-    }
-
-    pub fn set_logout_sent(&mut self, logout_sent: bool) {
-        self.sent_logout = logout_sent;
-    }
-
     pub fn logon_sent(&self) -> bool {
-        self.sent_logon
+        self.logon_sent
     }
 
     pub fn set_logon_sent(&mut self, logon_sent: bool) {
-        self.sent_logon = logon_sent;
+        self.logon_sent = logon_sent;
+    }
+
+    pub fn logout_sent_time(&self) -> Option<Instant> {
+        self.logout_sent_time
+    }
+
+    pub fn set_logout_sent_time(&mut self, logout_sent: bool) {
+        if logout_sent {
+            self.logout_sent_time = Some(Instant::now());
+        } else {
+            self.logout_sent_time = None;
+        }
     }
 
     pub fn reset_received(&self) -> bool {
@@ -121,35 +131,27 @@ impl<S: MessagesStorage> State<S> {
     }
 
     pub fn reset_sent(&self) -> bool {
-        self.sent_reset
+        self.reset_sent
     }
 
     pub fn set_reset_sent(&mut self, reset_sent: bool) {
-        self.sent_reset = reset_sent;
+        self.reset_sent = reset_sent;
     }
 
     pub fn initiate(&self) -> bool {
         self.initiate
     }
 
-    pub fn set_test_request(&mut self, test_request: Int) {
-        self.test_request = test_request;
+    pub fn set_resend_range(&mut self, resend_range: RangeInclusive<SeqNum>) {
+        self.resend_range = Some(resend_range);
     }
 
-    pub fn set_resend_range(&mut self, resend_range: Option<RangeInclusive<SeqNum>>) {
-        self.resend_range = resend_range;
+    pub fn reset_resend_range(&mut self) {
+        self.resend_range = None;
     }
 
     pub fn resend_range(&self) -> Option<RangeInclusive<SeqNum>> {
         self.resend_range.clone()
-    }
-
-    pub fn heart_bt_int(&self) -> Int {
-        self.heart_bt_int
-    }
-
-    pub fn set_heart_bt_int(&mut self, heart_bt_int: Int) {
-        self.heart_bt_int = heart_bt_int;
     }
 
     pub fn set_last_sent_time(&mut self, last_sent_time: Instant) {
@@ -173,7 +175,7 @@ impl<S: MessagesStorage> State<S> {
     /// high on logon and tag 789 is supported.
     pub fn set_reset_range_from_last_expected_logon_next_seq_num(&mut self) {
         // we have already requested all msgs from nextExpectedMsgSeqNum to infinity
-        self.set_resend_range(Some(self.next_expected_msg_seq_num..=0));
+        self.set_resend_range(self.next_expected_msg_seq_num..=0);
         // clean up the variable (not really needed)
         self.next_expected_msg_seq_num = 0;
     }
@@ -186,11 +188,18 @@ impl<S: MessagesStorage> State<S> {
         self.next_expected_msg_seq_num != 0
     }
 
-    pub fn enqueue_msg(&mut self, msg: Box<FixtMessage>) {
-        self.queue.enqueue(msg.header.msg_seq_num, msg);
+    #[instrument(skip_all)]
+    pub fn enqueue_msg(&mut self, msg: Box<M>) {
+        let seq_num = msg.msg_seq_num();
+        trace!(msg_seq_num = seq_num, msg_type = ?msg.msg_type());
+        self.queue.enqueue(seq_num, msg);
     }
 
-    pub fn retrieve_msg(&mut self) -> Option<Box<FixtMessage>> {
+    pub fn lowest_queued_seq_num(&self) -> Option<SeqNum> {
+        self.queue.first_seq()
+    }
+
+    pub fn retrieve_msg(&mut self) -> Option<Box<M>> {
         self.queue.retrieve(self.next_target_msg_seq_num())
     }
 
@@ -198,7 +207,7 @@ impl<S: MessagesStorage> State<S> {
         self.queue.clear();
     }
 
-    pub fn fetch_range(&mut self, range: RangeInclusive<SeqNum>) -> Vec<Vec<u8>> {
+    pub fn fetch_range(&mut self, range: RangeInclusive<SeqNum>) -> impl Iterator<Item = &[u8]> {
         self.messages_storage.fetch_range(range)
     }
 
@@ -234,6 +243,21 @@ impl<S: MessagesStorage> State<S> {
         self.messages_storage.reset();
     }
 
+    pub fn disconnect(&mut self, reset: bool) {
+        self.set_disconnected(true);
+
+        self.set_logout_sent_time(false);
+        self.set_reset_received(false);
+        self.set_reset_sent(false);
+        self.set_last_expected_logon_next_seq_num(0);
+        if reset {
+            self.reset();
+        }
+
+        self.reset_resend_range();
+        self.clear_queue();
+    }
+
     pub fn disconnected(&self) -> bool {
         self.disconnected
     }
@@ -242,11 +266,21 @@ impl<S: MessagesStorage> State<S> {
         self.disconnected = disconnected;
     }
 
-    pub fn input_timoeut_cnt(&self) -> u32 {
-        self.input_timeout_cnt
+    pub fn input_timeout_cnt(&self) -> usize {
+        self.grace_period_test_req_ids.len()
     }
 
-    pub fn set_input_timoeut_cnt(&mut self, timoeut_cnt: u32) {
-        self.input_timeout_cnt = timoeut_cnt;
+    pub fn register_grace_period_test_req_id(&mut self, test_req_id: FixString) {
+        self.grace_period_test_req_ids.insert(test_req_id);
+    }
+
+    pub fn validate_grace_period_test_req_id(&mut self, test_req_id: &FixString) {
+        if self.grace_period_test_req_ids.contains(test_req_id) {
+            self.reset_grace_period();
+        }
+    }
+
+    pub fn reset_grace_period(&mut self) {
+        self.grace_period_test_req_ids.clear();
     }
 }

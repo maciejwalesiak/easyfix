@@ -1,26 +1,25 @@
 use std::{
-    cell::RefCell,
-    collections::{hash_map::Entry, HashMap},
+    cell::{Cell, RefCell},
     rc::Rc,
-    sync::Mutex,
+    time::Duration,
 };
 
-use easyfix_messages::{
-    fields::{FixString, SessionStatus},
-    messages::{FixtMessage, Message},
+use easyfix_core::{
+    base_messages::SessionStatusBase, basic_types::FixString, message::SessionMessage,
 };
-use futures_util::{pin_mut, Stream};
+use futures_util::{Stream, pin_mut};
 use tokio::{
     self,
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::mpsc,
-    time::Duration,
+    sync::{mpsc, oneshot},
 };
 use tokio_stream::StreamExt;
-use tracing::{debug, error, info, info_span, Instrument};
+use tracing::{Instrument, Span, debug, error, info, info_span, warn};
 
 use crate::{
+    DisconnectReason, Error, NO_INBOUND_TIMEOUT_PADDING, Sender, SessionError,
+    TEST_REQUEST_THRESHOLD,
     acceptor::{ActiveSessionsMap, SessionsMap},
     application::{Emitter, FixEventInternal},
     messages_storage::MessagesStorage,
@@ -28,73 +27,21 @@ use crate::{
     session_id::SessionId,
     session_state::State,
     settings::{SessionSettings, Settings},
-    DisconnectReason, Error, Sender, SessionError, NO_INBOUND_TIMEOUT_PADDING,
 };
 
 mod input_stream;
-pub use input_stream::{input_stream, InputEvent, InputStream};
+pub use input_stream::{InputEvent, InputStream, input_stream};
 
 mod output_stream;
-use output_stream::{output_stream, OutputEvent};
+use output_stream::{OutputEvent, output_stream};
 
 pub mod time;
-use time::{timeout, timeout_stream};
+use time::{timeout, timeout_at, timeout_stream};
 
-static SENDERS: Mutex<Option<HashMap<SessionId, Sender>>> = Mutex::new(None);
-
-pub fn register_sender(session_id: SessionId, sender: Sender) {
-    if let Entry::Vacant(entry) = SENDERS
-        .lock()
-        .unwrap()
-        .get_or_insert_with(HashMap::new)
-        .entry(session_id)
-    {
-        entry.insert(sender);
-    }
-}
-
-pub fn unregister_sender(session_id: &SessionId) {
-    if SENDERS
-        .lock()
-        .unwrap()
-        .get_or_insert_with(HashMap::new)
-        .remove(session_id)
-        .is_none()
-    {
-        // TODO: ERROR?
-    }
-}
-
-pub fn sender(session_id: &SessionId) -> Option<Sender> {
-    SENDERS
-        .lock()
-        .unwrap()
-        .get_or_insert_with(HashMap::new)
-        .get(session_id)
-        .cloned()
-}
-
-// TODO: Remove?
-pub fn send(session_id: &SessionId, msg: Box<Message>) -> Result<(), Box<Message>> {
-    if let Some(sender) = sender(session_id) {
-        sender.send(msg).map_err(|msg| msg.body)
-    } else {
-        Err(msg)
-    }
-}
-
-pub fn send_raw(msg: Box<FixtMessage>) -> Result<(), Box<FixtMessage>> {
-    if let Some(sender) = sender(&SessionId::from_input_msg(&msg)) {
-        sender.send_raw(msg)
-    } else {
-        Err(msg)
-    }
-}
-
-async fn first_msg(
-    stream: &mut (impl Stream<Item = InputEvent> + Unpin),
+async fn first_msg<M>(
+    stream: &mut (impl Stream<Item = InputEvent<M>> + Unpin),
     logon_timeout: Duration,
-) -> Result<Box<FixtMessage>, Error> {
+) -> Result<Box<M>, Error> {
     match timeout(logon_timeout, stream.next()).await {
         Ok(Some(InputEvent::Message(msg))) => Ok(msg),
         Ok(Some(InputEvent::IoError(error))) => Err(error.into()),
@@ -107,58 +54,133 @@ async fn first_msg(
 }
 
 #[derive(Debug)]
-struct Connection<S> {
-    session: Rc<Session<S>>,
+struct Connection<M: SessionMessage, S> {
+    session: Rc<Session<M, S>>,
 }
 
-pub(crate) async fn acceptor_connection<S>(
+/// Removes a connection's session from the active sessions map when the
+/// connection task finishes, **including when it panics**. Without this,
+/// a panicking task leaves the session in `active_sessions` forever: every
+/// reconnect attempt is rejected with "Session already active" and a later
+/// logout request fails on the closed output channel.
+struct SessionCleanupGuard<M: SessionMessage, S: MessagesStorage> {
+    session_id: SessionId,
+    state: Rc<RefCell<State<M, S>>>,
+    active_sessions: Rc<RefCell<ActiveSessionsMap<M, S>>>,
+    reset_on_disconnect: bool,
+}
+
+impl<M: SessionMessage, S: MessagesStorage> Drop for SessionCleanupGuard<M, S> {
+    fn drop(&mut self) {
+        // try_borrow_mut: this can run during unwind, never panic here
+        match self.active_sessions.try_borrow_mut() {
+            Ok(mut active_sessions) => {
+                active_sessions.remove(&self.session_id);
+            }
+            Err(_) => error!(
+                session_id = %self.session_id,
+                "session cleanup failed: active sessions map already borrowed"
+            ),
+        }
+
+        match self.state.try_borrow_mut() {
+            Ok(mut state) => {
+                // Normally cleared by `emit_logout` in the output loop, which
+                // never runs when the task panics. Stale logon flags would
+                // reject the next logon with "Invalid logon state".
+                state.set_logon_received(false);
+                state.set_logon_sent(false);
+                if !state.disconnected() {
+                    warn!(
+                        session_id = %self.session_id,
+                        "connection task finished without disconnecting, forcing disconnected state"
+                    );
+                    state.disconnect(self.reset_on_disconnect);
+                }
+            }
+            Err(_) => error!(
+                session_id = %self.session_id,
+                "session cleanup failed: session state already borrowed"
+            ),
+        }
+    }
+}
+
+pub(crate) async fn acceptor_connection<M: SessionMessage, S>(
     reader: impl AsyncRead + Unpin,
     writer: impl AsyncWrite + Unpin,
     settings: Settings,
-    sessions: Rc<RefCell<SessionsMap<S>>>,
-    active_sessions: Rc<RefCell<ActiveSessionsMap<S>>>,
-    emitter: Emitter,
+    sessions: Rc<RefCell<SessionsMap<M, S>>>,
+    active_sessions: Rc<RefCell<ActiveSessionsMap<M, S>>>,
+    emitter: Emitter<M>,
+    enabled: Rc<Cell<bool>>,
 ) where
     S: MessagesStorage,
 {
-    let stream = input_stream(reader);
+    let stream = input_stream::<_, M>(reader);
     let logon_timeout =
         settings.auto_disconnect_after_no_logon_received + NO_INBOUND_TIMEOUT_PADDING;
     pin_mut!(stream);
     let msg = match first_msg(&mut stream, logon_timeout).await {
         Ok(msg) => msg,
         Err(err) => {
-            error!("failed to establish new session: {err}");
+            error!(%err, "failed to establish new session");
             return;
         }
     };
-    let session_id = SessionId::from_input_msg(&msg);
-    debug!("first_msg: {msg:?}");
+
+    let session_id = SessionId::from_input(&*msg);
+    debug!(first_msg = ?msg);
+
+    // XXX: there should be no await point between active_sessions.insert below
+    if !enabled.get() {
+        warn!("Acceptor is disabled, drop connection");
+        return;
+    }
 
     let (sender, receiver) = mpsc::unbounded_channel();
     let sender = Sender::new(sender);
 
     let Some((session_settings, session_state)) = sessions.borrow().get_session(&session_id) else {
-        error!("failed to establish new session: unknown session id {session_id}");
+        error!(%session_id, "failed to establish new session: unknown session id");
         return;
     };
+    if !session_state.borrow_mut().disconnected()
+        || active_sessions.borrow().contains_key(&session_id)
+    {
+        error!(%session_id, "Session already active");
+        return;
+    }
     session_state.borrow_mut().set_disconnected(false);
-    register_sender(session_id.clone(), sender.clone());
+
+    let _cleanup_guard = SessionCleanupGuard {
+        session_id: session_id.clone(),
+        state: session_state.clone(),
+        active_sessions: active_sessions.clone(),
+        reset_on_disconnect: session_settings.reset_on_disconnect,
+    };
+
+    let (disconnect_tx, disconnect_rx) = oneshot::channel();
+
     let session = Rc::new(Session::new(
         settings,
         session_settings,
         session_state,
         sender,
         emitter.clone(),
+        disconnect_tx,
     ));
+
     active_sessions
         .borrow_mut()
         .insert(session_id.clone(), session.clone());
 
     let session_span = info_span!(
+        parent: None,
         "session",
         id = %session_id
     );
+    session_span.follows_from(Span::current());
 
     let input_loop_span = info_span!(parent: &session_span, "in");
     let output_loop_span = info_span!(parent: &session_span, "out");
@@ -173,7 +195,7 @@ pub(crate) async fn acceptor_connection<S>(
         .send(FixEventInternal::Created(session_id.clone()))
         .await;
 
-    let input_timeout_duration = session.heartbeat_interval() + NO_INBOUND_TIMEOUT_PADDING;
+    let input_timeout_duration = session.heartbeat_interval().mul_f32(TEST_REQUEST_THRESHOLD);
     let input_stream = timeout_stream(input_timeout_duration, stream)
         .map(|res| res.unwrap_or(InputEvent::Timeout));
     pin_mut!(input_stream);
@@ -182,16 +204,17 @@ pub(crate) async fn acceptor_connection<S>(
     pin_mut!(output_stream);
 
     let connection = Connection::new(session);
-    let (input_closed_tx, input_closed_rx) = tokio::sync::oneshot::channel();
+    let (input_closed_tx, input_closed_rx) = oneshot::channel();
 
     tokio::join!(
         connection
             .input_loop(
                 input_stream,
                 input_closed_tx,
-                force_disconnection_with_reason
+                force_disconnection_with_reason,
+                disconnect_rx,
             )
-            .instrument(input_loop_span.clone()),
+            .instrument(input_loop_span),
         connection
             .output_loop(writer, output_stream, input_closed_rx)
             .instrument(output_loop_span),
@@ -199,17 +222,15 @@ pub(crate) async fn acceptor_connection<S>(
     session_span.in_scope(|| {
         info!("connection closed");
     });
-    unregister_sender(&session_id);
-    active_sessions.borrow_mut().remove(&session_id);
 }
 
-pub(crate) async fn initiator_connection<S>(
+pub(crate) async fn initiator_connection<M: SessionMessage, S>(
     tcp_stream: TcpStream,
     settings: Settings,
     session_settings: SessionSettings,
-    state: Rc<RefCell<State<S>>>,
-    active_sessions: Rc<RefCell<ActiveSessionsMap<S>>>,
-    emitter: Emitter,
+    state: Rc<RefCell<State<M, S>>>,
+    active_sessions: Rc<RefCell<ActiveSessionsMap<M, S>>>,
+    emitter: Emitter<M>,
 ) where
     S: MessagesStorage,
 {
@@ -220,13 +241,22 @@ pub(crate) async fn initiator_connection<S>(
     let (sender, receiver) = mpsc::unbounded_channel();
     let sender = Sender::new(sender);
 
-    register_sender(session_id.clone(), sender.clone());
+    let (disconnect_tx, disconnect_rx) = oneshot::channel();
+
+    let _cleanup_guard = SessionCleanupGuard {
+        session_id: session_id.clone(),
+        state: state.clone(),
+        active_sessions: active_sessions.clone(),
+        reset_on_disconnect: session_settings.reset_on_disconnect,
+    };
+
     let session = Rc::new(Session::new(
         settings,
         session_settings,
         state,
         sender,
         emitter.clone(),
+        disconnect_tx,
     ));
     active_sessions
         .borrow_mut()
@@ -245,8 +275,8 @@ pub(crate) async fn initiator_connection<S>(
         .send(FixEventInternal::Created(session_id.clone()))
         .await;
 
-    let input_timeout_duration = session.heartbeat_interval() + NO_INBOUND_TIMEOUT_PADDING;
-    let input_stream = timeout_stream(input_timeout_duration, input_stream(source))
+    let input_timeout_duration = session.heartbeat_interval().mul_f32(TEST_REQUEST_THRESHOLD);
+    let input_stream = timeout_stream(input_timeout_duration, input_stream::<_, M>(source))
         .map(|res| res.unwrap_or(InputEvent::Timeout));
     pin_mut!(input_stream);
 
@@ -258,31 +288,30 @@ pub(crate) async fn initiator_connection<S>(
     session.send_logon_request(&mut session.state().borrow_mut());
 
     let connection = Connection::new(session);
-    let (input_closed_tx, input_closed_rx) = tokio::sync::oneshot::channel();
+    let (input_closed_tx, input_closed_rx) = oneshot::channel();
 
     tokio::join!(
         connection
-            .input_loop(input_stream, input_closed_tx, None)
+            .input_loop(input_stream, input_closed_tx, None, disconnect_rx)
             .instrument(input_loop_span),
         connection
             .output_loop(sink, output_stream, input_closed_rx)
             .instrument(output_loop_span),
     );
     info!("connection closed");
-    unregister_sender(&session_id);
-    active_sessions.borrow_mut().remove(&session_id);
 }
 
-impl<S: MessagesStorage> Connection<S> {
-    fn new(session: Rc<Session<S>>) -> Connection<S> {
+impl<M: SessionMessage, S: MessagesStorage> Connection<M, S> {
+    fn new(session: Rc<Session<M, S>>) -> Connection<M, S> {
         Connection { session }
     }
 
     async fn input_loop(
         &self,
-        mut input_stream: impl Stream<Item = InputEvent> + Unpin,
-        input_closed_tx: tokio::sync::oneshot::Sender<()>,
+        mut input_stream: impl Stream<Item = InputEvent<M>> + Unpin,
+        input_closed_tx: oneshot::Sender<()>,
         force_disconnection_with_reason: Option<DisconnectReason>,
+        mut disconnect_rx: oneshot::Receiver<()>,
     ) {
         if let Some(disconnect_reason) = force_disconnection_with_reason {
             self.session
@@ -299,8 +328,41 @@ impl<S: MessagesStorage> Connection<S> {
         }
 
         let mut disconnect_reason = DisconnectReason::Disconnected;
+        let mut logout_deadline = None;
 
-        while let Some(event) = input_stream.next().await {
+        let mut next_item = async || {
+            if logout_deadline.is_none() {
+                logout_deadline = self.session.logout_deadline();
+            }
+            if let Some(logout_deadline) = logout_deadline {
+                timeout_at(logout_deadline, input_stream.next())
+                    .await
+                    .unwrap_or(Some(InputEvent::LogoutTimeout))
+            } else {
+                input_stream.next().await
+            }
+        };
+
+        loop {
+            let event = tokio::select! {
+                // Wait for network input
+                event = next_item() => {
+                    if let Some(event) = event {
+                        // Don't process event here, it won't be cancel-safe
+                        event
+                    } else {
+                        break
+                    }
+                }
+
+                // Wait for disconnect signal from Session::disconnect()
+                _ = &mut disconnect_rx => {
+                    info!("Disconnect signaled, exiting input loop");
+                    disconnect_reason = DisconnectReason::ApplicationForcedDisconnect;
+                    break;
+                }
+            };
+
             // Don't accept new messages if session is disconnected.
             if self.session.state().borrow().disconnected() {
                 info!("session disconnected, exit input processing");
@@ -309,27 +371,27 @@ impl<S: MessagesStorage> Connection<S> {
                 // See `fn send()` and `fn send_raw()` from session.rs.
                 input_closed_tx
                     .send(())
-                    .expect("Failed to notify about closed inpout");
+                    .expect("Failed to notify about closed input");
                 return;
             }
+
             match event {
                 InputEvent::Message(msg) => {
-                    if let Some(dr) = self.session.on_message_in(msg).await {
-                        info!("disconnect ({dr:?}), exit input processing");
-                        disconnect_reason = dr;
+                    if let Some(reason) = self.session.on_message_in(msg).await {
+                        info!(?reason, "disconnect, exit input processing");
+                        disconnect_reason = reason;
                         break;
                     }
-                    self.session.state().borrow_mut().set_input_timoeut_cnt(0);
                 }
                 InputEvent::DeserializeError(error) => {
-                    if let Some(dr) = self.session.on_deserialize_error(error).await {
-                        info!("disconnect ({dr:?}), exit input processing");
-                        disconnect_reason = dr;
+                    if let Some(reason) = self.session.on_deserialize_error(error).await {
+                        info!(?reason, "disconnect, exit input processing");
+                        disconnect_reason = reason;
                         break;
                     }
                 }
                 InputEvent::IoError(error) => {
-                    error!("Input error: {error:?}");
+                    error!(%error, "Input error");
                     disconnect_reason = DisconnectReason::IoError;
                     break;
                 }
@@ -337,13 +399,18 @@ impl<S: MessagesStorage> Connection<S> {
                     if self.session.on_in_timeout().await {
                         self.session.send_logout(
                             &mut self.session.state().borrow_mut(),
-                            Some(SessionStatus::SessionLogoutComplete),
+                            Some(SessionStatusBase::SessionLogoutComplete.into()),
                             Some(FixString::from_ascii_lossy(
                                 b"Grace period is over".to_vec(),
                             )),
                         );
                         break;
                     }
+                }
+                InputEvent::LogoutTimeout => {
+                    info!("Logout timeout");
+                    disconnect_reason = DisconnectReason::LogoutTimeout;
+                    break;
                 }
             }
         }
@@ -362,7 +429,7 @@ impl<S: MessagesStorage> Connection<S> {
         &self,
         mut sink: impl AsyncWrite + Unpin,
         mut output_stream: impl Stream<Item = OutputEvent> + Unpin,
-        input_closed_rx: tokio::sync::oneshot::Receiver<()>,
+        input_closed_rx: oneshot::Receiver<()>,
     ) {
         let mut sink_closed = false;
         let mut disconnect_reason = DisconnectReason::Disconnected;
@@ -377,7 +444,7 @@ impl<S: MessagesStorage> Connection<S> {
                         info!("Client disconnected, message will be stored for further resend");
                     } else if let Err(error) = sink.write_all(&msg).await {
                         sink_closed = true;
-                        error!("Output write error: {error:?}");
+                        error!(%error, "Output write error");
                         // XXX: Don't disconnect now. If IO error happened
                         //      here, it will aslo happen in input loop
                         //      and input loop will trigger disconnection.
@@ -397,10 +464,8 @@ impl<S: MessagesStorage> Connection<S> {
                     // inplementation, at this point no new messages
                     // can be send.
                     info!("Client disconnected");
-                    if !sink_closed {
-                        if let Err(e) = sink.flush().await {
-                            error!("final flush failed: {e}");
-                        }
+                    if !sink_closed && let Err(error) = sink.flush().await {
+                        error!(%error, "final flush failed");
                     }
                     disconnect_reason = reason;
                 }
@@ -415,6 +480,9 @@ impl<S: MessagesStorage> Connection<S> {
         // input_loop finished, so no more messages can be added to output
         // queue.
         let _ = input_closed_rx.await;
+        if let Err(error) = sink.shutdown().await {
+            error!(%error, "connection shutdown failed")
+        }
         info!("disconnect, exit output processing");
     }
 }

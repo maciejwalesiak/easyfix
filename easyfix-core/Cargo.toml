@@ -1,0 +1,26 @@
+[package]
+name = "easyfix-core"
+version = "0.1.0"
+authors = ["Łukasz Dańko <lukasz.danko@gmail.com>"]
+license = "MIT"
+description = "Easy FIX (Financial Information Exchange) toolset - core types."
+repository = "https://github.com/ldanko/easyfix"
+edition = "2024"
+
+[features]
+serde-serialize = ["dep:serde", "chrono/serde"]
+serde-deserialize = ["dep:serde", "chrono/serde"]
+
+[dependencies]
+chrono = { workspace = true }
+easyfix-macros = { workspace = true }
+itoa = { workspace = true }
+memchr = { workspace = true }
+rust_decimal = { workspace = true, default-features = false }
+serde = { workspace = true, optional = true, features = ["derive"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+assert_matches = { workspace = true }
+serde_json = { workspace = true }

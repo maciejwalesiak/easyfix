@@ -1,41 +1,42 @@
 use std::{cell::RefCell, collections::HashMap, net::SocketAddr, rc::Rc};
 
+use easyfix_core::message::SessionMessage;
 use pin_project::pin_project;
 use tokio::net::TcpStream;
-use tracing::{info, info_span, Instrument};
+use tracing::{Instrument, info, info_span};
 
 use crate::{
-    application::{events_channel, Emitter, EventStream},
+    Error,
+    application::{Emitter, EventStream, events_channel},
     io::initiator_connection,
     messages_storage::MessagesStorage,
     session::Session,
     session_id::SessionId,
     session_state::State,
     settings::{SessionSettings, Settings},
-    Error,
 };
 
 // TODO: Same as in Acceptor, not need for duplicate
-pub(crate) type ActiveSessionsMap<S> = HashMap<SessionId, Rc<Session<S>>>;
+pub(crate) type ActiveSessionsMap<M, S> = HashMap<SessionId, Rc<Session<M, S>>>;
 
 #[pin_project]
-pub struct Initiator<S: MessagesStorage> {
+pub struct Initiator<M: SessionMessage, S: MessagesStorage> {
     id: SessionId,
     settings: Settings,
     session_settings: SessionSettings,
-    state: Rc<RefCell<State<S>>>,
-    active_sessions: Rc<RefCell<ActiveSessionsMap<S>>>,
-    emitter: Emitter,
+    state: Rc<RefCell<State<M, S>>>,
+    active_sessions: Rc<RefCell<ActiveSessionsMap<M, S>>>,
+    emitter: Emitter<M>,
     #[pin]
-    event_stream: EventStream,
+    event_stream: EventStream<M>,
 }
 
-impl<S: MessagesStorage + 'static> Initiator<S> {
+impl<M: SessionMessage + 'static, S: MessagesStorage + 'static> Initiator<M, S> {
     pub fn new(
         settings: Settings,
         session_settings: SessionSettings,
         messages_storage: S,
-    ) -> Initiator<S> {
+    ) -> Initiator<M, S> {
         let (emitter, event_stream) = events_channel();
         Initiator {
             id: session_settings.session_id.clone(),

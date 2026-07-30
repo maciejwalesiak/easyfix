@@ -1,12 +1,12 @@
 use core::fmt;
 
-use easyfix_messages::{
-    fields::{FixStr, FixString},
-    messages::{FixtMessage, Header},
+use easyfix_core::{
+    basic_types::{FixStr, FixString},
+    message::HeaderAccess,
 };
-use serde::Deserialize;
-
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "serde-serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde-deserialize", derive(serde::Deserialize))]
 pub struct SessionId {
     begin_string: FixString,
     sender_comp_id: FixString,
@@ -60,27 +60,23 @@ impl SessionId {
         }
     }
 
-    pub fn from_input_msg(msg: &FixtMessage) -> SessionId {
-        SessionId::from_input_header(&msg.header)
-    }
-
-    pub fn from_input_header(header: &Header) -> SessionId {
+    /// Build a SessionId from an incoming message.
+    ///
+    /// The remote's SenderCompID becomes our TargetCompID and vice versa.
+    pub fn from_input(msg: &impl HeaderAccess) -> SessionId {
         SessionId::new(
-            header.begin_string.clone(),
-            header.target_comp_id.clone(),
-            header.sender_comp_id.clone(),
+            msg.version().begin_string(),
+            msg.target_comp_id().to_owned(),
+            msg.sender_comp_id().to_owned(),
         )
     }
 
-    pub fn from_output_msg(msg: &FixtMessage) -> SessionId {
-        SessionId::from_output_header(&msg.header)
-    }
-
-    pub fn from_output_header(header: &Header) -> SessionId {
+    /// Build a SessionId from an outgoing message.
+    pub fn from_output(msg: &impl HeaderAccess) -> SessionId {
         SessionId::new(
-            header.begin_string.clone(),
-            header.sender_comp_id.clone(),
-            header.target_comp_id.clone(),
+            msg.version().begin_string(),
+            msg.sender_comp_id().to_owned(),
+            msg.target_comp_id().to_owned(),
         )
     }
 

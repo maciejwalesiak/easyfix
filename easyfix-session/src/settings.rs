@@ -1,21 +1,32 @@
 use std::ops::RangeInclusive;
 
 use chrono::NaiveTime;
-use easyfix_messages::fields::FixString;
-use serde::{Deserialize, Deserializer};
+use easyfix_core::basic_types::{ApplVerId, FixString};
 use tokio::time::Duration;
 
 use crate::session_id::SessionId;
 
+#[cfg(feature = "serde-serialize")]
+fn duration_to_seconds<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_u64(duration.as_secs())
+}
+
+#[cfg(feature = "serde-deserialize")]
 fn duration_from_seconds<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
-    D: Deserializer<'de>,
+    D: serde::Deserializer<'de>,
 {
+    use serde::Deserialize;
     Ok(Duration::from_secs(u64::deserialize(deserializer)?))
 }
 
 /// FIX Trading Port session configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde-serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde-deserialize", derive(serde::Deserialize))]
 pub struct Settings {
     /// FIX SenderCompID<49> field value for outgoing messages.
     pub sender_comp_id: FixString,
@@ -23,18 +34,37 @@ pub struct Settings {
     pub sender_sub_id: Option<FixString>,
     /// Timeout \[s\] for inbound/outbound messages. When reached, `TestRequest<1>`
     /// is sent when inbound message is missing or `Heartbeat<0>` is sent when
-    /// outbound message is missing.
-    #[serde(deserialize_with = "duration_from_seconds")]
-    pub heartbeat_interval: Duration,
+    /// outbound message is missing. If not set value from Logon<A> will be used.
+    pub heartbeat_interval: Option<u64>,
     /// Timeout \[s\] for `Logon<A>` message, when reached, connection is dropped.
-    #[serde(deserialize_with = "duration_from_seconds")]
+    #[cfg_attr(
+        feature = "serde-serialize",
+        serde(serialize_with = "duration_to_seconds")
+    )]
+    #[cfg_attr(
+        feature = "serde-deserialize",
+        serde(deserialize_with = "duration_from_seconds")
+    )]
     pub auto_disconnect_after_no_logon_received: Duration,
     /// How many times `TestRequest<1> `is sent when inbound timeout is reached,
     /// before connection is dropped.
     pub auto_disconnect_after_no_heartbeat: u32,
+    /// Timeout for waiting for Logout<5> acknowledgment during graceful
+    /// session termination. If exceeded, the session terminates forcefully.
+    #[cfg_attr(
+        feature = "serde-serialize",
+        serde(serialize_with = "duration_to_seconds")
+    )]
+    #[cfg_attr(
+        feature = "serde-deserialize",
+        serde(deserialize_with = "duration_from_seconds")
+    )]
+    pub auto_disconnect_after_no_logout: Duration,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde-serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde-deserialize", derive(serde::Deserialize))]
 pub struct SessionSettings {
     pub session_id: SessionId,
     // TODO: Optional
@@ -43,8 +73,11 @@ pub struct SessionSettings {
 
     pub send_redundant_resend_requests: bool,
     pub check_comp_id: bool,
-    pub check_latency: bool,
-    pub max_latency: Duration,
+
+    /// Maximum allowed difference between message SendingTime(52) and current
+    /// time. If `None`, SendingTime is not validated. If `Some`, messages with
+    /// SendingTime differing by more than this duration are rejected.
+    pub max_latency: Option<Duration>,
 
     pub reset_on_logon: bool,
     pub reset_on_logout: bool,
@@ -52,17 +85,22 @@ pub struct SessionSettings {
 
     pub refresh_on_logon: bool,
 
-    pub sender_default_appl_ver_id: FixString,
-    pub target_default_appl_ver_id: FixString,
+    pub sender_default_appl_ver_id: ApplVerId,
+    pub target_default_appl_ver_id: ApplVerId,
 
     /// Enable the next expected message sequence number (optional tag 789
     /// on Logon) on sent Logon message and use value of tag 789 on received
     /// Logon message to synchronize session.
     pub enable_next_expected_msg_seq_num: bool,
 
-    // Enable messages persistence.
+    /// Enable messages persistence.
     pub persist: bool,
 
-    // Enable Logout<5> verification.
+    /// Enable Logout<5> verification.
     pub verify_logout: bool,
+
+    /// When enabled, idle session auto-close grace period counter will only
+    /// reset when incoming heartbeat's TestReqID tag value matches value
+    /// from one of outgoing grace period's TestRequests.
+    pub verify_test_request_id: bool,
 }

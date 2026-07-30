@@ -1,15 +1,21 @@
 [package]
 name = "easyfix-dictionary"
-version = "0.4.1"
+version = "0.4.2"
 authors = ["Łukasz Dańko <lukasz.danko@gmail.com>"]
 license = "MIT"
-description = "Easy FIX (Financial Information Exchange) toolset - quickfix compatible messages dictionary."
+description = "Easy FIX (Financial Information Exchange) toolset - messages dictionary."
 repository = "https://github.com/ldanko/easyfix"
 readme = "README.md"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85.0"
 
 [dependencies]
-anyhow = { workspace = true }
-strum = "0.26"
-strum_macros = "0.26"
+easyfix-core = { workspace = true, features = ["serde-serialize", "serde-deserialize"] }
+quick-xml = { version = "0.37.2", features = ["serialize"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
 xmltree = "0.10"
+
+[dev-dependencies]
+assert_matches = "1.5.0"
+uuid = { version = "1.8.0", features = ["v4"] }
